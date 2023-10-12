@@ -67,3 +67,8 @@ plugins:
        # forward and the packet rate for the window recalculated
        rate_window_slide: 10
 
+       # Output avro files containing detailed information about attacks
+       write_avro: true
+
+       # Output a summary file containing attack counts
+       write_summary: false

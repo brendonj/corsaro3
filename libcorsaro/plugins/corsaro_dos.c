@@ -62,6 +62,7 @@
 
 #include "khash.h"
 #include "ksort.h"
+#include "libcorsaro_common.h"
 #include "libcorsaro_plugin.h"
 #include "libcorsaro_avro.h"
 #include "corsaro_dos.h"
@@ -96,6 +97,12 @@ KHASH_SET_INIT_INT(32xx)
 /** The minimum packet rate before a vector can be an attack */
 #define CORSARO_DOS_DEFAULT_VECTOR_MIN_PPM 30
 
+/** Whether avro files should be written */
+#define CORSARO_DOS_DEFAULT_WRITE_AVRO 1
+
+/** Whether summary statistics should be written */
+#define CORSARO_DOS_DEFAULT_WRITE_SUMMARY 0
+
 static corsaro_plugin_t corsaro_dos_plugin = {
 
     PLUGIN_NAME,
@@ -121,7 +128,10 @@ typedef struct corsaro_dos_config {
     uint16_t ppm_window_size;
     /** The amount of time to slide the PPM window (in seconds) */
     uint16_t ppm_window_slide;
-
+    /** Whether avro files should be written */
+    uint8_t write_avro;
+    /** Whether summary statistics should be written */
+    uint8_t write_summary;
 } corsaro_dos_config_t;
 
 /** State for the sliding packet rate algorithm */
@@ -298,6 +308,7 @@ struct corsaro_dos_state_t {
 
 typedef struct corsaro_dos_merge_state {
     corsaro_avro_writer_t *mainwriter;
+    FILE *summarywriter;
     struct corsaro_dos_state_t *combined;
 } corsaro_dos_merge_state_t;
 
@@ -560,6 +571,8 @@ int corsaro_dos_parse_config(corsaro_plugin_t *p, yaml_document_t *doc,
     conf->attack_min_ppm = CORSARO_DOS_DEFAULT_VECTOR_MIN_PPM;
     conf->ppm_window_size = CORSARO_DOS_DEFAULT_PPM_WINDOW_SIZE;
     conf->ppm_window_slide = CORSARO_DOS_DEFAULT_PPM_WINDOW_PRECISION;
+    conf->write_avro = CORSARO_DOS_DEFAULT_WRITE_AVRO;
+    conf->write_summary = CORSARO_DOS_DEFAULT_WRITE_SUMMARY;
 
     if (options->type != YAML_MAPPING_NODE) {
         corsaro_log(p->logger,
@@ -606,6 +619,33 @@ int corsaro_dos_parse_config(corsaro_plugin_t *p, yaml_document_t *doc,
             conf->ppm_window_slide = strtoul(val, NULL, 0);
         }
 
+        if (key->type == YAML_SCALAR_NODE && value->type == YAML_SCALAR_NODE
+                && strcmp((char *)key->data.scalar.value,
+                    "write_avro") == 0) {
+
+            uint8_t opt = 0;
+            if (parse_onoff_option(p->logger, val, &(opt), "write_avro") == 0) {
+                if (opt == 1) {
+                    conf->write_avro = 1;
+                } else {
+                    conf->write_avro = 0;
+                }
+            }
+        }
+
+        if (key->type == YAML_SCALAR_NODE && value->type == YAML_SCALAR_NODE
+                && strcmp((char *)key->data.scalar.value,
+                    "write_summary") == 0) {
+
+            uint8_t opt = 0;
+            if (parse_onoff_option(p->logger, val, &(opt), "write_summary") == 0) {
+                if (opt == 1) {
+                    conf->write_summary = 1;
+                } else {
+                    conf->write_summary = 0;
+                }
+            }
+        }
     }
 
     p->config = conf;
@@ -663,6 +703,12 @@ int corsaro_dos_finalise_config(corsaro_plugin_t *p,
     corsaro_log(p->logger,
             "dos plugin: window slides in increments of %u seconds",
             conf->ppm_window_slide);
+    corsaro_log(p->logger,
+            "dos plugin: avro files %s be written",
+            conf->write_avro ? "will" : "won't");
+    corsaro_log(p->logger,
+            "dos plugin: summary statistics files %s be written",
+            conf->write_summary ? "will" : "won't");
     return 0;
 }
 
@@ -1229,7 +1275,7 @@ int corsaro_dos_process_packet(corsaro_plugin_t *p, void *local,
 
 /** ------------- MERGING API -------------------- */
 
-static int write_attack_vectors(corsaro_logger_t *logger,
+static int64_t write_attack_vectors(corsaro_logger_t *logger,
         corsaro_dos_merge_state_t *mstate, kh_av_t *attack_hash,
         uint32_t ts, corsaro_dos_config_t *conf) {
 
@@ -1240,6 +1286,7 @@ static int write_attack_vectors(corsaro_logger_t *logger,
     double duration;
     struct timeval tvdiff;
     uint32_t thismaxppm = 0;
+    int64_t active_count = 0;
 
     for (i = kh_begin(attack_hash); i != kh_end(attack_hash); ++i) {
         if (!kh_exist(attack_hash, i)) {
@@ -1276,41 +1323,52 @@ static int write_attack_vectors(corsaro_logger_t *logger,
             goto resetvec;
         }
 
-        avro = corsaro_populate_avro_item(mstate->mainwriter, vec, dos_to_avro);
-        if (avro == NULL) {
-            corsaro_log(logger,
-                    "could not convert attack vector to Avro record");
-            return -1;
+        if (conf->write_avro) {
+            avro = corsaro_populate_avro_item(mstate->mainwriter, vec,
+                    dos_to_avro);
+            if (avro == NULL) {
+                corsaro_log(logger,
+                        "could not convert attack vector to Avro record");
+                return -1;
+            }
+
+            if (corsaro_append_avro_writer(mstate->mainwriter, avro) < 0) {
+                corsaro_log(logger,
+                        "could not write attack vector to Avro output file.");
+                return -1;
+            }
         }
 
-        if (corsaro_append_avro_writer(mstate->mainwriter, avro) < 0) {
-            corsaro_log(logger,
-                    "could not write attack vector to Avro output file.");
-            return -1;
-        }
+        active_count++;
 
 resetvec:
         vec->thread_cnt = 0;
     }
-    return 0;
+    return active_count;
 }
 
 void *corsaro_dos_init_merging(corsaro_plugin_t *p, int sources) {
 
     corsaro_dos_merge_state_t *m;
+    corsaro_dos_config_t *config;
+
     m = (corsaro_dos_merge_state_t *)calloc(1,
             sizeof(corsaro_dos_merge_state_t));
     if (m == NULL) {
         return NULL;
     }
 
-    m->mainwriter = corsaro_create_avro_writer(p->logger, DOS_RESULT_SCHEMA);
+    config = (corsaro_dos_config_t *)(p->config);
 
-    if (m->mainwriter == NULL) {
-        corsaro_log(p->logger,
-                "error while creating main avro writer for dos plugin!");
-        free(m);
-        return NULL;
+    if (config->write_avro) {
+        m->mainwriter = corsaro_create_avro_writer(p->logger, DOS_RESULT_SCHEMA);
+
+        if (m->mainwriter == NULL) {
+            corsaro_log(p->logger,
+                    "error while creating main avro writer for dos plugin!");
+            free(m);
+            return NULL;
+        }
     }
 
     m->combined = calloc(1, sizeof(struct corsaro_dos_state_t));
@@ -1332,6 +1390,11 @@ int corsaro_dos_halt_merging(corsaro_plugin_t *p, void *local) {
 
     if (m->mainwriter) {
         corsaro_destroy_avro_writer(m->mainwriter);
+    }
+
+    if (m->summarywriter) {
+        /* TODO do we need a .done file? */
+        fclose(m->summarywriter);
     }
 
     if (m->combined) {
@@ -1636,6 +1699,8 @@ int corsaro_dos_merge_interval_results(corsaro_plugin_t *p, void *local,
     int i;
     int ret = 0;
     char *outname;
+    int64_t active_count = 0;
+    int64_t tmp_count;
 
     m = (corsaro_dos_merge_state_t *)(local);
     if (m == NULL) {
@@ -1645,12 +1710,26 @@ int corsaro_dos_merge_interval_results(corsaro_plugin_t *p, void *local,
     config = (corsaro_dos_config_t *)(p->config);
 
     /* First step, open an output file if we need one */
-    if (!corsaro_is_avro_writer_active(m->mainwriter)) {
+    if (config->write_avro && !corsaro_is_avro_writer_active(m->mainwriter)) {
         outname = p->derive_output_name(p, local, fin->timestamp, -1);
         if (outname == NULL) {
             return -1;
         }
         if (corsaro_start_avro_writer(m->mainwriter, outname, 0) == -1) {
+            free(outname);
+            return -1;
+        }
+        free(outname);
+    }
+
+    if (config->write_summary && m->summarywriter == NULL) {
+        outname = p->derive_output_name(p, local, fin->timestamp, -1);
+        if (outname == NULL) {
+            return -1;
+        }
+        // replace the "avro" suffix with "summ"
+        strcpy(outname + strlen(outname) - 4, "summ");
+        if ((m->summarywriter = fopen(outname, "w")) == NULL) {
             free(outname);
             return -1;
         }
@@ -1668,22 +1747,41 @@ int corsaro_dos_merge_interval_results(corsaro_plugin_t *p, void *local,
     }
 
     /* Dump combined to our avro file */
-    if (write_attack_vectors(p->logger, m,
-            m->combined->attack_hash_tcp, fin->timestamp, config) < 0) {
+    if ((tmp_count = write_attack_vectors(p->logger, m,
+            m->combined->attack_hash_tcp, fin->timestamp, config)) < 0) {
         ret = -1;
         goto endmerge;
     }
+    if (tmp_count > 0) {
+        active_count += tmp_count;
+    }
 
-    if (write_attack_vectors(p->logger, m,
-            m->combined->attack_hash_udp, fin->timestamp, config) < 0) {
+    if ((tmp_count = write_attack_vectors(p->logger, m,
+            m->combined->attack_hash_udp, fin->timestamp, config)) < 0) {
         ret = -1;
         goto endmerge;
     }
+    if (tmp_count > 0) {
+        active_count += tmp_count;
+    }
 
-    if (write_attack_vectors(p->logger, m,
-            m->combined->attack_hash_icmp, fin->timestamp, config) < 0) {
+    if ((tmp_count = write_attack_vectors(p->logger, m,
+            m->combined->attack_hash_icmp, fin->timestamp, config)) < 0) {
         ret = -1;
         goto endmerge;
+    }
+    if (tmp_count > 0) {
+        active_count += tmp_count;
+    }
+
+    if (config->write_summary) {
+        printf("%u %ld\n", fin->timestamp, active_count);
+
+        if (fprintf(m->summarywriter, "%u %ld\n", fin->timestamp, active_count) < 0) {
+            corsaro_log(p->logger, "could not write to summary file");
+            ret = -1;
+            goto endmerge;
+        }
     }
 
 endmerge:
@@ -1692,18 +1790,32 @@ endmerge:
 
 int corsaro_dos_rotate_output(corsaro_plugin_t *p, void *local) {
     corsaro_dos_merge_state_t *m;
+    int ret = 0;
+    corsaro_dos_config_t *config = (corsaro_dos_config_t *)(p->config);
 
     m = (corsaro_dos_merge_state_t *)(local);
     if (m == NULL) {
         return -1;
     }
 
-    if (m->mainwriter == NULL || corsaro_close_avro_writer(m->mainwriter) < 0)
-    {
-        return -1;
+    if (config->write_avro) {
+        printf("closing avro file for rotation\n");
+        if (m->mainwriter == NULL ||
+                corsaro_close_avro_writer(m->mainwriter) < 0) {
+            ret = -1;
+        }
     }
 
-    return 0;
+    if (config->write_summary) {
+        printf("closing summary file for rotation\n");
+        /* TODO write a done file? */
+        if (m->summarywriter == NULL || fclose(m->summarywriter) != 0) {
+            ret = -1;
+        }
+        m->summarywriter = NULL;
+    }
+
+    return ret;
 }
 
 // vim: set sw=4 tabstop=4 softtabstop=4 expandtab :
