@@ -330,9 +330,12 @@ static libtrace_packet_t * per_packet(libtrace_t *trace,
         pthread_mutex_lock(&(glob->mutex));
         tls->current_interval.time = glob->first_pkt_ts;
         pthread_mutex_unlock(&(glob->mutex));
-        tls->lastrotateinterval.time = tls->current_interval.time -
+
+        if (glob->rotatefreq > 0) {
+            tls->lastrotateinterval.time = tls->current_interval.time -
                 (tls->current_interval.time %
-                (glob->interval * glob->rotatefreq));
+                 (glob->interval * glob->rotatefreq));
+        }
 
         corsaro_push_start_plugins(tls->plugins, tls->current_interval.number,
                 tls->current_interval.time);
@@ -340,8 +343,10 @@ static libtrace_packet_t * per_packet(libtrace_t *trace,
         tls->next_report = tls->current_interval.time -
                 (tls->current_interval.time % glob->interval) +
                  glob->interval;
-        tls->next_rotate = tls->lastrotateinterval.time +
+        if (glob->rotatefreq > 0) {
+            tls->next_rotate = tls->lastrotateinterval.time +
                 (glob->interval * glob->rotatefreq);
+        }
     }
 
     if (ts < tls->current_interval.time) {
